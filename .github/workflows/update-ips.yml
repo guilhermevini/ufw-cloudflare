@@ -1,0 +1,59 @@
+name: Update Cloudflare IPs
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: bot/update-ips
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download IP lists
+        run: ./update_ips.sh
+
+      # main is protected (PR + green CI required), so changes go through an auto-merged pull request
+      - name: Open pull request
+        run: |
+          if git diff --quiet; then
+            echo "No changes to the IP lists."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$BRANCH"
+          git commit -am "chore: update Cloudflare IP lists"
+          git push --force origin "$BRANCH"
+
+          if [ "$(gh pr view "$BRANCH" --json state -q .state 2>/dev/null)" != "OPEN" ]; then
+            gh pr create --head "$BRANCH" --base main \
+              --title "chore: update Cloudflare IP lists" \
+              --body "Automated update from https://www.cloudflare.com/ips-v4 and /ips-v6. Merged automatically once CI passes."
+          fi
+
+          # Events created with GITHUB_TOKEN do not start other workflows, except workflow_dispatch
+          gh workflow run ci.yml --ref "$BRANCH"
+          gh pr merge "$BRANCH" --auto --squash
+
+  # GitHub disables scheduled workflows after 60 days without repository activity.
+  # Re-enabling the workflow through the API resets that timer without creating commits.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh workflow enable update-ips.yml --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}

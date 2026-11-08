@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync UFW rules with Cloudflare IP ranges
+Documentation=https://github.com/guilhermevini/ufw-cloudflare
+Wants=network-online.target
+After=network-online.target ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ufw-cloudflare

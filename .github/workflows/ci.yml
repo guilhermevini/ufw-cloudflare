@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:  # used by update-ips.yml, whose pull requests do not trigger CI on their own
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: ShellCheck
+        run: shellcheck ufw-cloudflare update_ips.sh deploy.sh tests/integration.sh tests/bin/*
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Unit tests
+        run: bats tests
+
+  # Runs against the real ufw of each distribution, inside a throwaway container
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:22.04', 'ubuntu:24.04', 'debian:12', 'debian:13']
+    steps:
+      - uses: actions/checkout@v7
+      - name: Integration tests on ${{ matrix.image }}
+        run: |
+          docker run --rm --cap-add NET_ADMIN -v "$PWD:/src" -w /src "${{ matrix.image }}" bash -c '
+            apt-get update -qq && apt-get install -y -qq ufw > /dev/null
+            tests/integration.sh
+          '
