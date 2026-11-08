@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# ufw-cloudflare: keep UFW rules in sync with Cloudflare's IP ranges, so only Cloudflare can reach your origin.
+# https://github.com/guilhermevini/ufw-cloudflare
+set -o errexit -o errtrace -o nounset -o pipefail
+
+if [[ ${DEBUG-} =~ ^(1|yes|true)$ ]]; then
+    set -o xtrace
+fi
+
+# Stable sorting for comm(1) and English output from ufw, which this script parses
+export LC_ALL=C
+
+readonly VERSION='1.0.0'
+readonly CLOUDFLARE_URL='https://www.cloudflare.com'
+readonly UFW_DEFAULTS='/etc/default/ufw'
+
+ports='80,443'
+proto='tcp'
+ip_version='all'
+source='url'
+ipv4_file='list_ipv4.txt'
+ipv6_file='list_ipv6.txt'
+comment='cloudflare'
+dry_run=false
+remove=false
+
+usage() {
+    cat <<EOF
+Usage: ufw-cloudflare [options]
+
+Allow Cloudflare's IP ranges through UFW and keep the rules in sync: new ranges
+are added, ranges Cloudflare no longer uses are removed. Only rules created by
+this script (identified by their comment) are ever touched.
+
+Options:
+  --ports LIST          Ports to allow, e.g. 443 or 80,443 or 8000:8100 (default: $ports)
+  --proto PROTO         tcp or udp (default: $proto)
+  --ip-version VERSION  4, 6 or all (default: $ip_version)
+  --source SOURCE       url downloads the lists from Cloudflare, file reads local files (default: $source)
+  --ipv4-file PATH      IPv4 list used with --source file (default: $ipv4_file)
+  --ipv6-file PATH      IPv6 list used with --source file (default: $ipv6_file)
+  --comment NAME        Comment that tags the rules managed by this script (default: $comment)
+  --dry-run             Show what would change without touching UFW
+  --remove              Delete every rule tagged with the comment and exit
+  -h, --help            Show this help
+  --version             Show the version
+
+Run as root. Set DEBUG=1 to trace the execution.
+EOF
+}
+
+die() {
+    echo "ufw-cloudflare: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "WARNING: $*" >&2
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --ports | --proto | --ip-version | --source | --ipv4-file | --ipv6-file | --comment)
+                [[ $# -ge 2 && -n $2 ]] || die "option $1 requires a value"
+                case $1 in
+                    --ports) ports=$2 ;;
+                    --proto) proto=$2 ;;
+                    --ip-version) ip_version=$2 ;;
+                    --source) source=$2 ;;
+                    --ipv4-file) ipv4_file=$2 ;;
+                    --ipv6-file) ipv6_file=$2 ;;
+                    --comment) comment=$2 ;;
+                esac
+                shift 2
+                ;;
+            --dry-run) dry_run=true && shift ;;
+            --remove) remove=true && shift ;;
+            -h | --help) usage && exit 0 ;;
+            --version) echo "ufw-cloudflare $VERSION" && exit 0 ;;
+            *) die "unknown option: $1 (see --help)" ;;
+        esac
+    done
+
+    [[ $ports =~ ^[0-9]+(:[0-9]+)?(,[0-9]+(:[0-9]+)?)*$ ]] || die "invalid --ports: $ports"
+    [[ $proto =~ ^(tcp|udp)$ ]] || die "invalid --proto: $proto (use tcp or udp)"
+    [[ $ip_version =~ ^(4|6|all)$ ]] || die "invalid --ip-version: $ip_version (use 4, 6 or all)"
+    [[ $source =~ ^(url|file)$ ]] || die "invalid --source: $source (use url or file)"
+    [[ $comment =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid --comment: $comment (letters, digits, '_', '.' and '-' only)"
+
+    # ufw stores multiple ports in ascending order, so do the same to compare rules
+    ports=$(tr ',' '\n' <<< "$ports" | sort -n -u | paste -sd, -)
+}
+
+fetch_list() {
+    local v=$1 file
+    if [[ $source == file ]]; then
+        if [[ $v == 4 ]]; then file=$ipv4_file; else file=$ipv6_file; fi
+        [[ -r $file ]] || die "cannot read $file"
+        cat -- "$file"
+    elif command -v curl > /dev/null; then
+        curl -fsSL --retry 3 "$CLOUDFLARE_URL/ips-v$v"
+    else
+        wget -qO- "$CLOUDFLARE_URL/ips-v$v"
+    fi
+}
+
+# Prints the validated CIDRs of one IP version. Fails on any invalid or empty list, so that
+# a broken download can never be mistaken for "Cloudflare has no IPs" and wipe the rules.
+load_cidrs() {
+    local v=$1 raw line pattern
+    local -a cidrs=()
+    raw=$(fetch_list "$v") || die "could not read the IPv$v list (source: $source)"
+    if [[ $v == 4 ]]; then
+        pattern='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    else
+        pattern='^[0-9A-Fa-f]*:[0-9A-Fa-f:]*/[0-9]{1,3}$'
+    fi
+    while IFS= read -r line; do
+        line=${line%%#*}
+        line=${line//[[:space:]]/}
+        if [[ -z $line ]]; then
+            continue
+        fi
+        [[ $line =~ $pattern ]] || die "invalid IPv$v CIDR: '$line'"
+        cidrs+=("$line")
+    done <<< "$raw"
+    [[ ${#cidrs[@]} -gt 0 ]] || die "the IPv$v list is empty; refusing to continue"
+    printf '%s\n' "${cidrs[@]}" | sort -u
+}
+
+# Prints its argument followed by a newline, or nothing at all if it is empty
+lines() {
+    if [[ -n $1 ]]; then
+        printf '%s\n' "$1"
+    fi
+}
+
+count() {
+    if [[ -z $1 ]]; then echo 0; else wc -l <<< "$1" | tr -d ' '; fi
+}
+
+# Rules managed by this script, as printed by "ufw show added" minus the "ufw " prefix and the comment:
+#   allow from 173.245.48.0/20 to any port 80,443 proto tcp
+managed_rules() {
+    local line
+    while IFS= read -r line; do
+        if [[ $line == "ufw allow from "*" comment '$comment'" ]]; then
+            line=${line#ufw }
+            printf '%s\n' "${line% comment *}"
+        fi
+    done <<< "$1"
+}
+
+# Filters rules by IP version, based on the source address (third word)
+of_version() {
+    awk -v v="$1" '($3 ~ /:/) == (v == 6)'
+}
+
+warn_open_ports() {
+    local added=$1 port rule
+    for port in ${ports//,/ }; do
+        if rule=$(grep -m1 -E "^ufw allow ${port}(/${proto})?( comment .*)?$" <<< "$added"); then
+            warn "'$rule' allows port $port from anywhere, so Cloudflare is not the only way in."
+        fi
+    done
+    if rule=$(grep -m1 -E "^ufw allow '?(Nginx|Apache)( Full| HTTP| HTTPS| Secure)?'?$" <<< "$added"); then
+        warn "'$rule' allows a web server profile from anywhere, so Cloudflare is not the only way in."
+    fi
+}
+
+sync_version() {
+    local v=$1 managed=$2 label="[IPv$1]"
+    local want='' have to_add to_delete cidrs rule cidr port p
+    if ! $remove; then
+        cidrs=$(load_cidrs "$v")
+        want=$(while IFS= read -r cidr; do
+            echo "allow from $cidr to any port $ports proto $proto"
+        done <<< "$cidrs" | sort)
+    fi
+    have=$(lines "$managed" | of_version "$v" | sort)
+    to_add=$(comm -23 <(lines "$want") <(lines "$have"))
+    to_delete=$(comm -13 <(lines "$want") <(lines "$have"))
+
+    if $remove && [[ -z $to_delete ]]; then
+        echo "$label No rules tagged '$comment' to remove."
+        return
+    elif $remove; then
+        echo "$label Removing $(count "$to_delete") rules tagged '$comment'."
+    elif [[ -z $to_add && -z $to_delete ]]; then
+        echo "$label Already up to date ($(count "$want") ranges, port $ports/$proto)."
+        return
+    else
+        echo "$label $(count "$want") Cloudflare ranges, port $ports/$proto: +$(count "$to_add") / -$(count "$to_delete")"
+    fi
+
+    while IFS= read -r rule; do
+        if [[ -n $rule ]]; then
+            read -r _ _ cidr _ <<< "$rule"
+            echo "  + $cidr"
+        fi
+    done <<< "$to_add"
+    while IFS= read -r rule; do
+        if [[ -n $rule ]]; then
+            read -r _ _ cidr _ _ _ port _ p <<< "$rule"
+            echo "  - $cidr (port $port/$p)"
+        fi
+    done <<< "$to_delete"
+
+    if $dry_run; then
+        echo "$label Dry run: no changes made."
+        return
+    fi
+
+    # Add before deleting, so a port change never leaves a window where Cloudflare is blocked
+    while IFS= read -r rule; do
+        if [[ -n $rule ]]; then
+            read -r _ _ cidr _ <<< "$rule"
+            ufw allow from "$cidr" to any port "$ports" proto "$proto" comment "$comment" > /dev/null
+        fi
+    done <<< "$to_add"
+    while IFS= read -r rule; do
+        if [[ -n $rule ]]; then
+            local -a args
+            read -ra args <<< "$rule"
+            ufw delete "${args[@]}" > /dev/null
+        fi
+    done <<< "$to_delete"
+    echo "$label Done."
+}
+
+main() {
+    parse_args "$@"
+    command -v ufw > /dev/null || die "ufw is not installed (apt install ufw)"
+
+    local -a versions
+    case $ip_version in
+        4) versions=(4) ;;
+        6) versions=(6) ;;
+        all) versions=(4 6) ;;
+    esac
+    if grep -qsE '^[[:space:]]*IPV6=no' "$UFW_DEFAULTS"; then
+        [[ $ip_version != 6 ]] || die "IPv6 is disabled in $UFW_DEFAULTS"
+        if [[ $ip_version == all ]] && ! $remove; then
+            echo "[IPv6] Skipped: IPv6 is disabled in $UFW_DEFAULTS."
+        fi
+        versions=(4)
+    fi
+
+    local added status managed v
+    added=$(ufw show added 2>&1) || die "'ufw show added' failed (are you root?): $added"
+    managed=$(managed_rules "$added")
+
+    if ! $remove; then
+        if status=$(ufw status 2>&1) && [[ $status == "Status: inactive"* ]]; then
+            warn "ufw is inactive: the rules are saved but not enforced until you run 'ufw enable'."
+        fi
+        warn_open_ports "$added"
+    fi
+
+    for v in "${versions[@]}"; do
+        sync_version "$v" "$managed"
+    done
+}
+
+main "$@"

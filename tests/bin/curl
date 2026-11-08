@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# curl stand-in: serves the last argument (the URL) from $CURL_STUB_DIR/<basename of the URL>
+set -euo pipefail
+
+url=${*: -1}
+cat "$CURL_STUB_DIR/$(basename "$url")"

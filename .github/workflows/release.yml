@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the tag matches VERSION
+        run: |
+          version=$(sed -n "s/^readonly VERSION='\(.*\)'$/\1/p" ufw-cloudflare)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match VERSION ${version}"
+            exit 1
+          fi
+      - name: Test
+        run: |
+          sudo apt-get update && sudo apt-get install -y bats
+          shellcheck ufw-cloudflare
+          bats tests
+      - name: Create GitHub release with the script and its checksum attached
+        run: |
+          sha256sum ufw-cloudflare > ufw-cloudflare.sha256
+          gh release create "$GITHUB_REF_NAME" ufw-cloudflare ufw-cloudflare.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Installs the release exactly as documented in the README
+  verify-release:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download from the release URL and check the checksum
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          cd "$(mktemp -d)"
+          curl -fsSLO "$base/ufw-cloudflare"
+          curl -fsSLO "$base/ufw-cloudflare.sha256"
+          sha256sum -c ufw-cloudflare.sha256
+          chmod +x ufw-cloudflare
+          ./ufw-cloudflare --version

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Minimal ufw stand-in for the tests. Rules live in $UFW_STUB_RULES, one per line, in the
+# format printed by "ufw show added"; every call is appended to $UFW_STUB_LOG.
+set -euo pipefail
+
+echo "ufw $*" >> "$UFW_STUB_LOG"
+touch "$UFW_STUB_RULES"
+
+case $1 in
+    show)
+        echo "Added user rules (see 'ufw status' for running firewall):"
+        cat "$UFW_STUB_RULES"
+        ;;
+    status)
+        echo "Status: ${UFW_STUB_STATUS:-active}"
+        ;;
+    allow)
+        args=("$@")
+        n=${#args[@]}
+        if [ "$n" -ge 2 ] && [ "${args[n - 2]}" = comment ]; then
+            args[n - 1]="'${args[n - 1]}'"
+        fi
+        rule="ufw ${args[*]}"
+        if grep -qxF "$rule" "$UFW_STUB_RULES"; then
+            echo 'Skipping adding existing rule'
+        else
+            echo "$rule" >> "$UFW_STUB_RULES"
+            echo 'Rules updated'
+        fi
+        ;;
+    delete)
+        shift
+        rule="ufw $*"
+        if ! grep -qE "^$(printf '%s' "$rule" | sed 's/[.[\*^$/]/\\&/g')( comment .*)?$" "$UFW_STUB_RULES"; then
+            echo 'Could not delete non-existent rule'
+            exit 0
+        fi
+        grep -vE "^$(printf '%s' "$rule" | sed 's/[.[\*^$/]/\\&/g')( comment .*)?$" "$UFW_STUB_RULES" > "$UFW_STUB_RULES.tmp" || true
+        mv "$UFW_STUB_RULES.tmp" "$UFW_STUB_RULES"
+        echo 'Rules updated'
+        ;;
+    *)
+        echo "ufw stub: unsupported command: $*" >&2
+        exit 1
+        ;;
+esac
